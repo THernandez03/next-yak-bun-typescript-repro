@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "next-yak",
+    "composite": true,
+    "outDir": "dist"
+  },
+  "include": ["src/**/*"]
+}
