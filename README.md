@@ -1,80 +1,103 @@
-# next-yak + Bun Workspaces: TypeScript Errors (TS2349 + TS2786)
+# next-yak + Bun Workspaces: TypeScript Compatibility Analysis
 
-Minimal reproduction of two TypeScript errors that occur when using `next-yak` with Bun workspaces and `noUncheckedIndexedAccess: true`.
+This repo reproduces TypeScript errors (TS2349, TS2786) that appear when using `next-yak` in a Bun workspace. It documents the root causes, whose responsibility they are, and how to work around them today.
 
-## Reproduce
+> For the full reproduction details and error explanations, see [PROBLEM.md](./PROBLEM.md).
+
+---
+
+## Whose bug is it?
+
+Both errors stem from an **interaction between two independently reasonable behaviors** — neither tool is strictly wrong, but together they produce a broken experience.
+
+### TS2349 — `styled.button` not callable → `next-yak` issue
+
+`next-yak` defines `YakJSX.IntrinsicElements` as a mapped type without the `-?` modifier:
+
+```ts
+type IntrinsicElements = {
+  [K in keyof React.JSX.IntrinsicElements]: React.JSX.IntrinsicElements[K] &
+    YakAttributes;
+};
+```
+
+When `noUncheckedIndexedAccess: true` is active, TypeScript widens every indexed access `T[K]` on a mapped type to `T[K] | undefined`. This is a well-known TypeScript behavior. The fix belongs in `next-yak` — adding `-?` to the key makes the type non-optional and immune to `noUncheckedIndexedAccess`:
+
+```ts
+type IntrinsicElements = {
+  [K in keyof React.JSX.IntrinsicElements]-?: React.JSX.IntrinsicElements[K] &
+    YakAttributes;
+};
+```
+
+### TS2786 — `YakComponent` cannot be used as JSX → shared Bun + `next-yak` issue
+
+Bun's **isolated linker** (the default in workspaces with `configVersion = 1`) installs packages as symlinks pointing into a global virtual store at `~/.bun/install/cache/links/next-yak@X.Y.Z.../`. TypeScript follows the symlink and then searches for peer dependencies (like `react`) by walking up ancestor directories from that cache path — a path that never reaches the project root where `@types/react` is installed. This causes `React.FunctionComponent` to be unresolved, making `YakComponent<any>` fail the JSX element type check.
+
+- **Bun's side:** the isolated linker's global symlink strategy breaks TypeScript's ancestor-directory module resolution for packages without a `"types"` export condition.
+- **`next-yak`'s side:** if `next-yak` added a `"types"` condition to its `exports` map, Bun would materialize the package into the project-local `node_modules/.bun/` instead of the global cache, restoring TypeScript's ability to find peer types.
+
+---
+
+## Why `bun install --linker hoisted` fixes everything
+
+The **hoisted linker** flattens all dependencies into a single `node_modules/` at the project root — the classic npm/Yarn behavior:
+
+```
+node_modules/
+  next-yak/       ← real files, not a symlink to a global cache
+  react/
+  @types/react/
+  ...
+```
+
+Because `next-yak` is a real directory under the project root, TypeScript's ancestor-directory search for `react` succeeds immediately. No symlinks, no global cache paths, no broken resolution chain. Both TS2349 and TS2786 disappear because:
+
+1. The module resolution works correctly → `React.FunctionComponent` resolves → TS2786 gone
+2. With correct resolution the types are fully valid, and TS2349 can be addressed independently
+
+The **isolated linker** creates this instead:
+
+```
+node_modules/
+  next-yak → ~/.bun/install/cache/links/next-yak@9.4.1.../  ← symlink
+```
+
+TypeScript follows the symlink and starts its ancestor search from `~/.bun/install/cache/links/...`, which has no `node_modules/@types/react` anywhere above it.
+
+---
+
+## Workarounds today (consumer side)
+
+### Option 1 — Switch to hoisted linker (quickest fix)
 
 ```bash
-bun install
-bun run typecheck
+bun install --linker hoisted
 ```
 
-Expected: 0 errors  
-Actual: TS2349 and TS2786 errors in `packages/app/src/Button.tsx`
+Or persist it in `bunfig.toml`:
 
-## Errors
-
-### TS2349 — `styled.button` is not callable
-
-```
-packages/app/src/Button.tsx(11,16): error TS2349: This expression is not callable.
-  Type 'LiteralWithAttrs<...> | undefined' has no call signatures.
+```toml
+[install]
+linker = "hoisted"
 ```
 
-**Root cause:** `jsxImportSource: "next-yak"` makes TypeScript use `YakJSX` as the JSX namespace. `YakJSX.IntrinsicElements` is a mapped type:
+This restores the flat `node_modules` structure that TypeScript's resolution expects. **Both errors disappear.**
 
-```ts
-type IntrinsicElements = {
-  [K in keyof React.JSX.IntrinsicElements]: React.JSX.IntrinsicElements[K] & { css?: ... }
-}
+### Option 2 — `bun patch` (keeps isolated linker, fixes TS2786)
+
+Patch `next-yak` to add a `"types"` condition to its exports. Bun then materializes the package locally instead of symlinking to the global cache:
+
+```bash
+bun patch next-yak
+# In the patched package.json, add "types" to all exports entries:
+# "exports": { ".": { "import": "...", "require": "...", "types": "./dist/index.d.ts" } }
+bun patch --commit next-yak
 ```
 
-When `noUncheckedIndexedAccess: true` is set (even in a parent/root tsconfig), TypeScript adds `| undefined` to the indexed access `[K]` on this mapped type. As a result, `styled.button` resolves to `LiteralWithAttrs<...> | undefined` — which has no call signatures.
+### Option 3 — Disable `noUncheckedIndexedAccess` per package (fixes TS2349 only)
 
-**Suggested fix in next-yak:** Use `-?` to strip the optionality from the mapped type key, preventing `noUncheckedIndexedAccess` from widening the type:
-
-```ts
-// Current — breaks with noUncheckedIndexedAccess: true
-type IntrinsicElements = {
-  [K in keyof React.JSX.IntrinsicElements]: React.JSX.IntrinsicElements[K] & YakAttributes
-}
-
-// Fix
-type IntrinsicElements = {
-  [K in keyof React.JSX.IntrinsicElements]-?: React.JSX.IntrinsicElements[K] & YakAttributes
-}
-```
-
----
-
-### TS2786 — `YakComponent` cannot be used as a JSX element
-
-```
-packages/app/src/Button.tsx(24,22): error TS2786: 'StyledButton' cannot be used as a JSX component.
-  Its type 'YakComponent<any>' is not a valid JSX element type.
-```
-
-**Root cause:** Bun installs packages as symlinks into a global cache at `~/.bun/install/cache/links/next-yak@X.Y.Z.../`. TypeScript follows the symlink and then resolves module imports (like `react`) by walking up ancestor directories from `~/.bun/install/cache/links/...` — a path that never reaches the project root, where `@types/react` is installed. Because `React.FunctionComponent` (which `YakComponent<T>` extends) is unresolved, TypeScript infers `YakComponent<any>` and rejects it as a JSX element type.
-
-**Suggested fix in next-yak:** Add `"types"` conditions to all entries in the `exports` map in `package.json`. When Bun detects a `"types"` condition in the exports, it treats the package differently during installation — placing it into the project-local `node_modules/.bun/` folder rather than symlinking to the global cache. This makes TypeScript's ancestor directory search reach the project root where `@types/react` lives:
-
-```diff
-  "exports": {
-    ".": {
-      "import": "./dist/index.js",
--     "require": "./dist/index.cjs"
-+     "require": "./dist/index.cjs",
-+     "types": "./dist/index.d.ts"
-    },
-```
-
----
-
-## Workarounds (consumer side)
-
-### Fix TS2349 only
-
-Add `"noUncheckedIndexedAccess": false` to the package-level tsconfig to override the root setting:
+In `packages/app/tsconfig.json`:
 
 ```json
 {
@@ -85,19 +108,28 @@ Add `"noUncheckedIndexedAccess": false` to the package-level tsconfig to overrid
 }
 ```
 
-### Fix both errors via `bun patch`
+This suppresses TS2349 but does not fix TS2786 on its own.
 
-```bash
-bun patch next-yak
-# Add "types" entries to package.json exports, then:
-bun patch --commit next-yak
-```
+---
 
-This causes Bun to copy the patched package into the project-local `node_modules/.bun/` folder, making TypeScript's ancestor search reach `@types/react`.
+## Recommended fix requests upstream
+
+| Where          | What to fix                                                            |
+| -------------- | ---------------------------------------------------------------------- |
+| `next-yak`     | Add `-?` to `YakJSX.IntrinsicElements` mapped type                     |
+| `next-yak`     | Add `"types"` condition to all `exports` entries in `package.json`     |
+| Bun (optional) | Consider preserving project-relative resolution for symlinked packages |
+
+---
 
 ## Environment
 
-- `next-yak`: 9.4.1
-- Bun: 1.3.x (symlink-based package manager)
-- TypeScript: 5.8.x
-- React: 19.x
+| Tool / Package     | Version                                                |
+| ------------------ | ------------------------------------------------------ |
+| Bun                | 1.3.14 (canary)                                        |
+| `next-yak`         | 9.4.1                                                  |
+| `react`            | 19.2.5                                                 |
+| `@types/react`     | 19.2.14                                                |
+| `@types/react-dom` | 19.2.3                                                 |
+| `typescript`       | 6.0.3                                                  |
+| Bun linker         | isolated (default for workspaces, `configVersion = 1`) |
